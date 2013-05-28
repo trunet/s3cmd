@@ -20,6 +20,9 @@ S3tools / S3cmd mailing lists:
 Amazon S3 homepage:
     http://aws.amazon.com/s3
 
+Threaded parallel upload/download merge:
+    Wagner Sartori Junior <wsartori@gmail.com>
+
 !!!
 !!! Please consult INSTALL file for installation instructions!
 !!!
