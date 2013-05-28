@@ -363,10 +363,10 @@ def do_put_work(item,seq,total):
     cfg = Config()
     s3 = S3(cfg)
 
-    uri_final = S3Uri(item[seq]['remote_uri'])
+    uri_final = S3Uri(item['remote_uri'])
 
     extra_headers = copy(cfg.extra_headers)
-    full_name_orig = item[seq]['full_name']
+    full_name_orig = item['full_name']
     full_name = full_name_orig
     seq_label = "[%d of %d]" % (seq, total)
     if Config().encrypt:
