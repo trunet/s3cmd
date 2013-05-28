@@ -27,6 +27,9 @@ import shutil
 import tempfile
 import S3.Exceptions
 
+import Queue
+import threading
+
 from copy import copy
 from optparse import OptionParser, Option, OptionValueError, IndentedHelpFormatter
 from logging import debug, info, warning, error
@@ -267,7 +270,6 @@ def cmd_bucket_delete(args):
 
 def cmd_object_put(args):
     cfg = Config()
-    s3 = S3(cfg)
 
     if len(args) == 0:
         raise ParameterError("Nothing to upload. Expecting a local file or directory and a S3 URI destination.")
@@ -315,45 +317,82 @@ def cmd_object_put(args):
         warning(u"Exiting now because of --dry-run")
         return
 
-    seq = 0
-    for key in local_list:
-        seq += 1
+    if cfg.parallel and len(local_list) > 1:
+        #Disabling progress metter for parallel downloads.
+        cfg.progress_meter = False
+        #Initialize Queue
+        global q
+        q = Queue.Queue()
+        
+        seq = 0
+        for key in local_list:
+            seq += 1
+            q.put([local_list[key],seq,len(local_list)])
 
-        uri_final = S3Uri(local_list[key]['remote_uri'])
+        for i in range(cfg.workers):
+            t = threading.Thread(target=put_worker)
+            t.daemon = True
+            t.start()
 
-        extra_headers = copy(cfg.extra_headers)
-        full_name_orig = local_list[key]['full_name']
-        full_name = full_name_orig
-        seq_label = "[%d of %d]" % (seq, local_count)
-        if Config().encrypt:
-            exitcode, full_name, extra_headers["x-amz-meta-s3tools-gpgenc"] = gpg_encrypt(full_name_orig)
-        if cfg.preserve_attrs or local_list[key]['size'] > (cfg.multipart_chunk_size_mb * 1024 * 1024):
-            attr_header = _build_attr_header(local_list, key)
-            debug(u"attr_header: %s" % attr_header)
-            extra_headers.update(attr_header)
+        #Necessary to ensure KeyboardInterrupt can actually kill
+        #Otherwise Queue.join() blocks until all queue elements have completed
+        while threading.active_count() > 1:
+            time.sleep(.1)
+
+        q.join()
+    else:
+        seq = 0
+        for key in local_list:
+            seq += 1
+            do_put_work(local_list[key],seq,len(local_list))
+
+def put_worker():
+    while True:
         try:
-            response = s3.object_put(full_name, uri_final, extra_headers, extra_label = seq_label)
-        except S3UploadError, e:
-            error(u"Upload of '%s' failed too many times. Skipping that file." % full_name_orig)
-            continue
-        except InvalidFileError, e:
-            warning(u"File can not be uploaded: %s" % e)
-            continue
-        speed_fmt = formatSize(response["speed"], human_readable = True, floating_point = True)
-        if not Config().progress_meter:
-            output(u"File '%s' stored as '%s' (%d bytes in %0.1f seconds, %0.2f %sB/s) %s" %
-                (unicodise(full_name_orig), uri_final, response["size"], response["elapsed"],
-                speed_fmt[0], speed_fmt[1], seq_label))
-        if Config().acl_public:
-            output(u"Public URL of the object is: %s" %
-                (uri_final.public_url()))
-        if Config().encrypt and full_name != full_name_orig:
-            debug(u"Removing temporary encrypted file: %s" % unicodise(full_name))
-            os.remove(full_name)
+            (item,seq,total) = q.get_nowait()
+        except Queue.Empty:
+            return
+        try:
+            do_put_work(item,seq,total)
+        except Exception, e:
+            report_exception(e)
+            exit
+        q.task_done()
+
+def do_put_work(item,seq,total):
+    cfg = Config()
+    s3 = S3(cfg)
+
+    uri_final = S3Uri(local_list[key]['remote_uri'])
+
+    extra_headers = copy(cfg.extra_headers)
+    full_name_orig = local_list[key]['full_name']
+    full_name = full_name_orig
+    seq_label = "[%d of %d]" % (seq, local_count)
+    if Config().encrypt:
+        exitcode, full_name, extra_headers["x-amz-meta-s3tools-gpgenc"] = gpg_encrypt(full_name_orig)
+    try:
+        response = s3.object_put(full_name, uri_final, extra_headers, extra_label = seq_label)
+    except S3UploadError, e:
+        error(u"Upload of '%s' failed too many times. Skipping that file." % full_name_orig)
+        continue
+    except InvalidFileError, e:
+        warning(u"File can not be uploaded: %s" % e)
+        continue
+    speed_fmt = formatSize(response["speed"], human_readable = True, floating_point = True)
+    if not Config().progress_meter:
+        output(u"File '%s' stored as '%s' (%d bytes in %0.1f seconds, %0.2f %sB/s) %s" %
+            (unicodise(full_name_orig), uri_final, response["size"], response["elapsed"],
+            speed_fmt[0], speed_fmt[1], seq_label))
+    if Config().acl_public:
+        output(u"Public URL of the object is: %s" %
+            (uri_final.public_url()))
+    if Config().encrypt and full_name != full_name_orig:
+        debug(u"Removing temporary encrypted file: %s" % unicodise(full_name))
+        os.remove(full_name)
 
 def cmd_object_get(args):
     cfg = Config()
-    s3 = S3(cfg)
 
     ## Check arguments:
     ## if not --recursive:
@@ -432,69 +471,114 @@ def cmd_object_get(args):
         warning(u"Exiting now because of --dry-run")
         return
 
-    seq = 0
-    for key in remote_list:
-        seq += 1
-        item = remote_list[key]
-        uri = S3Uri(item['object_uri_str'])
-        ## Encode / Decode destination with "replace" to make sure it's compatible with current encoding
-        destination = unicodise_safe(item['local_filename'])
-        seq_label = "[%d of %d]" % (seq, remote_count)
+    if cfg.parallel and len(remote_list) > 1:
+        #Disabling progress metter for parallel downloads.
+        cfg.progress_meter = False
+        #Initialize Queue
+        global q
+        q = Queue.Queue()
 
-        start_position = 0
+        seq = 0
+        for key in remote_list:
+            seq += 1
+            q.put([remote_list[key],seq,len(remote_list)])
 
-        if destination == "-":
-            ## stdout
-            dst_stream = sys.__stdout__
-            file_exists = True
-        else:
-            ## File
-            try:
-                file_exists = os.path.exists(destination)
-                try:
-                    dst_stream = open(destination, "ab")
-                except IOError, e:
-                    if e.errno == errno.ENOENT:
-                        basename = destination[:destination.rindex(os.path.sep)]
-                        info(u"Creating directory: %s" % basename)
-                        os.makedirs(basename)
-                        dst_stream = open(destination, "ab")
-                    else:
-                        raise
-                if file_exists:
-                    if Config().get_continue:
-                        start_position = dst_stream.tell()
-                    elif Config().force:
-                        start_position = 0L
-                        dst_stream.seek(0L)
-                        dst_stream.truncate()
-                    elif Config().skip_existing:
-                        info(u"Skipping over existing file: %s" % (destination))
-                        continue
-                    else:
-                        dst_stream.close()
-                        raise ParameterError(u"File %s already exists. Use either of --force / --continue / --skip-existing or give it a new name." % destination)
-            except IOError, e:
-                error(u"Skipping %s: %s" % (destination, e.strerror))
-                continue
+        for i in range(cfg.workers):
+            t = threading.Thread(target=get_worker)
+            t.daemon = True
+            t.start()
+
+        #Necessary to ensure KeyboardInterrupt can actually kill
+        #Otherwise Queue.join() blocks until all queue elements have completed
+        while threading.active_count() > 1:
+            time.sleep(.1)
+
+        q.join()
+    else:
+        seq = 0
+        for key in remote_list:
+            seq += 1
+            do_get_work(remote_list[key],seq,len(remote_list))
+
+def get_worker():
+    while True:
         try:
-            response = s3.object_get(uri, dst_stream, start_position = start_position, extra_label = seq_label)
+            (item,seq,total) = q.get_nowait()
+        except Queue.Empty:
+            return
+        try:
+            do_get_work(item,seq,total)
+        except ParameterError, e:
+            error(u"Parameter problem: %s" % e)
         except S3Error, e:
-            if not file_exists: # Delete, only if file didn't exist before!
-                debug(u"object_get failed for '%s', deleting..." % (destination,))
-                os.unlink(destination)
-            raise
+            error(u"S3 error: %s" % e)
+            exit
+        except Exception, e:
+            report_exception(e)
+            exit
+        q.task_done()
 
-        if response["headers"].has_key("x-amz-meta-s3tools-gpgenc"):
-            gpg_decrypt(destination, response["headers"]["x-amz-meta-s3tools-gpgenc"])
-            response["size"] = os.stat(destination)[6]
-        if not Config().progress_meter and destination != "-":
-            speed_fmt = formatSize(response["speed"], human_readable = True, floating_point = True)
-            output(u"File %s saved as '%s' (%d bytes in %0.1f seconds, %0.2f %sB/s)" %
-                (uri, destination, response["size"], response["elapsed"], speed_fmt[0], speed_fmt[1]))
-        if Config().delete_after_fetch:
-            s3.object_delete(uri)
-            output(u"File %s removed after fetch" % (uri))
+def do_get_work(item,seq,total):
+    cfg = Config()
+    s3 = S3(cfg)
+    uri = S3Uri(item['object_uri_str'])
+    ## Encode / Decode destination with "replace" to make sure it's compatible with current encoding
+    destination = unicodise_safe(item['local_filename'])
+    seq_label = "[%d of %d]" % (seq, remote_count)
+
+    start_position = 0
+
+    if destination == "-":
+        ## stdout
+        dst_stream = sys.__stdout__
+    else:
+        ## File
+        try:
+            file_exists = os.path.exists(destination)
+            try:
+               dst_stream = open(destination, "ab")
+            except IOError, e:
+                if e.errno == errno.ENOENT:
+                    basename = destination[:destination.rindex(os.path.sep)]
+                    info(u"Creating directory: %s" % basename)
+                    os.makedirs(basename)
+                    dst_stream = open(destination, "ab")
+                else:
+                    raise
+            if file_exists:
+                if Config().get_continue:
+                    start_position = dst_stream.tell()
+                elif Config().force:
+                    start_position = 0L
+                    dst_stream.seek(0L)
+                    dst_stream.truncate()
+                elif Config().skip_existing:
+                    info(u"Skipping over existing file: %s" % (destination))
+                    continue
+                else:
+                    dst_stream.close()
+                    raise ParameterError(u"File %s already exists. Use either of --force / --continue / --skip-existing or give it a new name." % destination)
+        except IOError, e:
+            error(u"Skipping %s: %s" % (destination, e.strerror))
+            continue
+    try:
+        response = s3.object_get(uri, dst_stream, start_position = start_position, extra_label = seq_label)
+    except S3Error, e:
+        if not file_exists: # Delete, only if file didn't exist before!
+            debug(u"object_get failed for '%s', deleting..." % (destination,))
+            os.unlink(destination)
+        raise
+
+    if response["headers"].has_key("x-amz-meta-s3tools-gpgenc"):
+        gpg_decrypt(destination, response["headers"]["x-amz-meta-s3tools-gpgenc"])
+        response["size"] = os.stat(destination)[6]
+    if not Config().progress_meter and destination != "-":
+        speed_fmt = formatSize(response["speed"], human_readable = True, floating_point = True)
+        output(u"File %s saved as '%s' (%d bytes in %0.1f seconds, %0.2f %sB/s)" %
+            (uri, destination, response["size"], response["elapsed"], speed_fmt[0], speed_fmt[1]))
+    if Config().delete_after_fetch:
+        s3.object_delete(uri)
+        output(u"File %s removed after fetch" % (uri))
 
 def cmd_object_del(args):
     for uri_str in args:
@@ -1897,6 +1981,8 @@ def main():
     optparser.add_option("-d", "--debug", dest="verbosity", action="store_const", const=logging.DEBUG, help="Enable debug output.")
     optparser.add_option(      "--version", dest="show_version", action="store_true", help="Show s3cmd version (%s) and exit." % (PkgInfo.version))
     optparser.add_option("-F", "--follow-symlinks", dest="follow_symlinks", action="store_true", default=False, help="Follow symbolic links as if they are regular files")
+    optparser.add_option(      "--parallel", dest="parallel", action="store_true", help="Download and upload files in parallel.")
+    optparser.add_option(      "--workers", dest="workers", default=10, help="Sets the number of workers to run for uploading and downloading files (can only be used in conjunction with the --parallel argument)")
     optparser.add_option(      "--cache-file", dest="cache_file", action="store", default="",  metavar="FILE", help="Cache FILE containing local source MD5 values")
     optparser.add_option("-q", "--quiet", dest="quiet", action="store_true", default=False, help="Silence output on stdout")
 
