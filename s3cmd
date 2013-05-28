@@ -375,8 +375,10 @@ def do_put_work(item,seq,total):
         response = s3.object_put(full_name, uri_final, extra_headers, extra_label = seq_label)
     except S3UploadError, e:
         error(u"Upload of '%s' failed too many times. Skipping that file." % full_name_orig)
+        return
     except InvalidFileError, e:
         warning(u"File can not be uploaded: %s" % e)
+        return
     speed_fmt = formatSize(response["speed"], human_readable = True, floating_point = True)
     if not Config().progress_meter:
         output(u"File '%s' stored as '%s' (%d bytes in %0.1f seconds, %0.2f %sB/s) %s" %
@@ -552,11 +554,13 @@ def do_get_work(item,seq,total):
                     dst_stream.truncate()
                 elif Config().skip_existing:
                     info(u"Skipping over existing file: %s" % (destination))
+                    return
                 else:
                     dst_stream.close()
                     raise ParameterError(u"File %s already exists. Use either of --force / --continue / --skip-existing or give it a new name." % destination)
         except IOError, e:
             error(u"Skipping %s: %s" % (destination, e.strerror))
+            return
     try:
         response = s3.object_get(uri, dst_stream, start_position = start_position, extra_label = seq_label)
     except S3Error, e:
@@ -1176,33 +1180,35 @@ def cmd_sync_local2remote(args):
         def _upload(local_list, seq, total, total_size):
             file_list = local_list.keys()
             file_list.sort()
-            for file in file_list:
-                seq += 1
-                item = local_list[file]
-                src = item['full_name']
-                uri = S3Uri(item['remote_uri'])
-                seq_label = "[%d of %d]" % (seq, total)
-                extra_headers = copy(cfg.extra_headers)
-                try:
-                    if cfg.preserve_attrs:
-                        attr_header = _build_attr_header(local_list, file)
-                        debug(u"attr_header: %s" % attr_header)
-                        extra_headers.update(attr_header)
-                    response = s3.object_put(src, uri, extra_headers, extra_label = seq_label)
-                except InvalidFileError, e:
-                    warning(u"File can not be uploaded: %s" % e)
-                    continue
-                except S3UploadError, e:
-                    error(u"%s: upload failed too many times. Skipping that file." % item['full_name_unicode'])
-                    continue
-                speed_fmt = formatSize(response["speed"], human_readable = True, floating_point = True)
-                if not cfg.progress_meter:
-                    output(u"File '%s' stored as '%s' (%d bytes in %0.1f seconds, %0.2f %sB/s) %s" %
-                        (item['full_name_unicode'], uri, response["size"], response["elapsed"],
-                        speed_fmt[0], speed_fmt[1], seq_label))
-                total_size += response["size"]
-                uploaded_objects_list.append(uri.object())
-            return seq, total_size
+
+            if cfg.parallel and len(file_list) > 1:
+                #Disabling progress metter for parallel downloads.
+                cfg.progress_meter = False
+                #Initialize Queue
+                global q
+                q = Queue.Queue()
+
+                seq = 0
+                for file in file_list:
+                    seq += 1
+                    q.put([local_list[file],seq,len(file_list)])
+
+                for i in range(cfg.workers):
+                    t = threading.Thread(target=sync_local2remote_worker)
+                    t.daemon = True
+                    t.start()
+
+                #Necessary to ensure KeyboardInterrupt can actually kill
+                #Otherwise Queue.join() blocks until all queue elements have completed
+                while threading.active_count() > 1:
+                    time.sleep(.1)
+
+                q.join()
+            else:
+                seq = 0
+                for file in file_list:
+                    seq += 1
+                    do_local2remote_work(local_list[file],seq,len(file_list))
 
         remote_list = fetch_remote_list(destination_base, recursive = True, require_attribs = True)
 
@@ -1328,6 +1334,70 @@ def cmd_sync_local2remote(args):
         _parent()
         if cfg.invalidate_on_cf:
             error(u"You cannot use both --cf-invalidate and --add-destination.")
+
+def sync_local2remote_worker():
+    while True:
+        try:
+            (item,seq,total) = q.get_nowait()
+        except Queue.Empty:
+            return
+        try:
+            do_local2remote_work(item,seq,total)
+        except Exception, e:
+            report_exception(e)
+            exit
+        q.task_done()
+
+def do_local2remote_work(item,seq,total):
+    def _build_attr_header(src):
+        import pwd, grp
+        attrs = {}
+        src = deunicodise(src)
+        st = os.stat_result(os.stat(src))
+        for attr in cfg.preserve_attrs_list:
+            if attr == 'uname':
+                try:
+                    val = pwd.getpwuid(st.st_uid).pw_name
+                except KeyError:
+                    attr = "uid"
+                    val = st.st_uid
+                    warning(u"%s: Owner username not known. Storing UID=%d instead." % (unicodise(src), val))
+            elif attr == 'gname':
+                try:
+                    val = grp.getgrgid(st.st_gid).gr_name
+                except KeyError:
+                    attr = "gid"
+                    val = st.st_gid
+                    warning(u"%s: Owner groupname not known. Storing GID=%d instead." % (unicodise(src), val))
+            else:
+                    val = getattr(st, 'st_' + attr)
+            attrs[attr] = val
+        result = ""
+        for k in attrs: result += "%s:%s/" % (k, attrs[k])
+        return { 'x-amz-meta-s3cmd-attrs' : result[:-1] }
+
+    s3 = S3(cfg)
+    src = item['full_name']
+    uri = S3Uri(item['remote_uri'])
+    seq_label = "[%d of %d]" % (seq, total)
+    extra_headers = copy(cfg.extra_headers)
+    try:
+        if cfg.preserve_attrs:
+            attr_header = _build_attr_header(src)
+            debug(u"attr_header: %s" % attr_header)
+            extra_headers.update(attr_header)
+            response = s3.object_put(src, uri, extra_headers, extra_label = seq_label)
+        except InvalidFileError, e:
+            warning(u"File can not be uploaded: %s" % e)
+            return
+        except S3UploadError, e:
+            error(u"%s: upload failed too many times. Skipping that file." % item['full_name_unicode'])
+            return
+        speed_fmt = formatSize(response["speed"], human_readable = True, floating_point = True)
+        if not cfg.progress_meter:
+            output(u"File '%s' stored as '%s' (%d bytes in %0.1f seconds, %0.2f %sB/s) %s" %
+                    (item['full_name_unicode'], uri, response["size"], response["elapsed"],
+                    speed_fmt[0], speed_fmt[1], seq_label))
 
 def cmd_sync(args):
     if (len(args) < 2):
